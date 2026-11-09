@@ -168,6 +168,8 @@ object Session {
         // The driver check first: how the game's textures are compressed follows what it found.
         val environment = gameEnvironment(context, paths, driver)
             .let { if (testProgram != null) it else DriverCheck.environment(context, paths, driver, it) }
+        // Whether the compat layer's transcoder keeps this game's textures compressed: its exit says if it may again.
+        val transcoding = testProgram == null && Drivers.transcodable(driver) && DriverCheck.transcodes(context, driver)
         FactorioConfig.write(context, paths, keyboard, Drivers.compression(driver, DriverCheck.transcodes(context, driver)))
         val started = Glibc.start(paths, command, paths.gameLog, environment, Drivers.libraries(paths, driver))
         game = started
@@ -179,7 +181,9 @@ object Session {
         windowOpened = false
         setState(State.RUNNING)
         val app = context.applicationContext
-        thread(name = "pocketfoundry-game-exit", isDaemon = true) { onGameExit(app, driver, started, started.waitFor()) }
+        thread(name = "pocketfoundry-game-exit", isDaemon = true) {
+            onGameExit(app, driver, transcoding, started, started.waitFor())
+        }
         watchForNoWindow(started, gamePid, paths.gameLog)
         context.startForegroundService(Intent(context, GameService::class.java))
     }
@@ -241,7 +245,7 @@ object Session {
     }
 
     @Synchronized
-    private fun onGameExit(context: Context, driver: String, process: Process, status: Int) {
+    private fun onGameExit(context: Context, driver: String, transcoding: Boolean, process: Process, status: Int) {
         if (process !== game) return
         val signal = SIGNALS[status - SIGNALLED]?.let { ", killed by $it" + if (noWindow) " as it opened no window" else "" } ?: ""
         val memory = DetailedLogs.takeLastMemory()?.takeIf { status != 0 }?.let { "; last memory: $it" } ?: ""
@@ -260,6 +264,10 @@ object Session {
             else -> null   // quit while loading, or a test program
         }
         outcome?.let { Drivers.record(context, driver, it) }
+        // A game that lost the GPU while loading with its textures kept compressed, then was quit or killed: the next
+        // one loads them unpacked (DriverCheck).
+        if (transcoding)
+            DriverCheck.gameEnded(context, driver, runCatching { Paths(context).gameLog.readText() }.getOrDefault(""))
         setState(State.STOPPED)
     }
 
