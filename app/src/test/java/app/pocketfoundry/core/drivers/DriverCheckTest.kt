@@ -87,4 +87,24 @@ class DriverCheckTest {
         val saved = JSONObject().put("off", "").put("transcode", false).put("failed", true)
         assertEquals("the test couldn't draw", DriverCheck.summary(saved))
     }
+
+    @Test fun `a game that lost the GPU as its sprites started loading lost it loading`() {
+        // A Mali-G76 on a Helio G95, with the transcoder on: the check's squares had drawn right.
+        val log = "6.371 Parallel sprite loader initialized (threads: 3, bitmaps: 4741)\n" +
+                  "MESA: error: zink: DEVICE LOST! (../src/gallium/drivers/zink/zink_kopper.c:886)\n"
+        assertEquals(true, DriverCheck.lostLoading(log))
+    }
+
+    @Test fun `a game that loaded first, or never lost the GPU, didn't`() {
+        assertEquals(false, DriverCheck.lostLoading("85.496 Factorio initialised\nMESA: error: zink: DEVICE LOST!\n"))
+        assertEquals(false, DriverCheck.lostLoading("82.136 Sprites loaded\n85.496 Factorio initialised\n"))
+        // Killed while loading, for want of memory: unpacked textures would only take more.
+        assertEquals(false, DriverCheck.lostLoading("6.371 Parallel sprite loader initialized (threads: 3)\n"))
+    }
+
+    @Test fun `the summary says when textures load unpacked after a game lost the GPU with them compressed`() {
+        val saved = JSONObject().put("off", "").put("transcode", false).put("transcodeFailedOn", "OpenGL ES 3.2 v1.r32p1")
+        assertEquals("compressed textures load unpacked: a game lost the GPU loading them kept compressed",
+                     DriverCheck.summary(saved))
+    }
 }
