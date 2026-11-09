@@ -20,13 +20,19 @@ import java.util.concurrent.TimeUnit
  *
  * On a Mali the check then tries the compat layer's transcoder, which keeps the game's BC textures compressed as ASTC
  * and EAC: if its squares come out right too, games use it; if they're wrong, or the check crashes, games load the
- * textures unpacked as before. Either way the game itself never runs into it.
+ * textures unpacked as before. The check's squares are small, though, and a game's atlases are not: a Mali-G76 on a
+ * Helio G95 drew the squares right and lost the GPU as the game's sprites started loading. A game that stops loading
+ * like that with the transcoder on turns it off for that driver until Android's driver changes ([gameEnded]). The
+ * driver's Options can also decide it themselves (`HYBRIS_BC_TEXTURES=0`), and the check then leaves it alone.
  */
 object DriverCheck {
     /** Our Mesa patch 0005: the Vulkan extensions Zink treats as missing. */
     const val HIDE = "ZINK_HIDE_EXTENSIONS"
     /** The compat layer's BC transcoder: 1 (on where the driver lacks BC) or 0 (Mesa unpacks the textures). */
     private const val TRANSCODER = "HYBRIS_BC_TEXTURES"
+    /** What Zink logs when the GPU is gone (runtime/mesa patch 0007), and Factorio once every texture is in. */
+    private const val DEVICE_LOST = "DEVICE LOST"
+    private const val LOADED = "Factorio initialised"
     /** Khronos's timeline semaphore layer (runtime/hybris), for Android drivers without the ones Zink needs. */
     private const val TIMELINE_LAYER = "VK_LAYER_KHRONOS_timeline_semaphore"
     /** What Zink says on such a driver. */
@@ -84,7 +90,8 @@ object DriverCheck {
         val saved = saved(context, driver)?.takeIf { it.optString("version") == version }
         val found = saved ?: check(context, paths, driver, environment, version)
         if (saved != null) summary(saved).takeIf { it.isNotEmpty() }?.let { ScreenLog.add("driver check: $it") }
-        val transcoded = found.optBoolean("transcode")
+        // Options that name the transcoder are already in the environment, after Drivers.environment's default.
+        val transcoded = transcoderOption(context, driver) == null && found.optBoolean("transcode")
         val base = if (found.optBoolean("timelines")) withTimelines(environment) else environment
         return hiding(base, offIn(found)) + if (transcoded) mapOf(TRANSCODER to "1") else emptyMap()
     }
@@ -94,8 +101,42 @@ object DriverCheck {
         check(context, paths, driver, environment, version(context, driver))
     }
 
-    /** Whether the last check found [driver] draws the game's compressed textures right through the transcoder. */
-    fun transcodes(context: Context, driver: String) = saved(context, driver)?.optBoolean("transcode") == true
+    /**
+     * Whether the game's compressed textures on [driver] go through the transcoder: as its Options say if they name it,
+     * else as the last check found, unless a game has stopped loading with it since.
+     */
+    fun transcodes(context: Context, driver: String) = when (transcoderOption(context, driver)) {
+        null -> saved(context, driver)?.optBoolean("transcode") == true
+        "0" -> false
+        else -> true
+    }
+
+    /** The transcoder as [driver]'s Options set it, or null when they leave it to the check. */
+    private fun transcoderOption(context: Context, driver: String): String? =
+        Drivers.parseOptions(Drivers.options(context, driver))[TRANSCODER]
+
+    /**
+     * After a game on [driver] that ran with the transcoder on: if it lost the GPU before it had loaded, the transcoder
+     * stays off for [driver]'s games until Android's driver changes, and its textures load unpacked. A game killed
+     * while loading for want of memory doesn't count: unpacked, its textures would take three times as much.
+     */
+    fun gameEnded(context: Context, driver: String, log: String) {
+        if (transcoderOption(context, driver) != null || !lostLoading(log)) return
+        val settings = Settings(context)
+        val all = json(settings.driverChecks)
+        val saved = all.optJSONObject(driver)?.takeIf { it.optBoolean("transcode") } ?: return
+        saved.put("transcode", false).put(TRANSCODE_FAILED, androidDriver(driver))
+        settings.driverChecks = all.toString()
+        ScreenLog.add("driver check: the game lost the GPU loading compressed textures kept compressed: " +
+                      "from the next game they load unpacked")
+    }
+
+    /** Whether a game's [log] shows it lost the GPU before it had loaded. */
+    internal fun lostLoading(log: String): Boolean {
+        val lost = log.indexOf(DEVICE_LOST)
+        val loaded = log.indexOf(LOADED)
+        return lost >= 0 && (loaded < 0 || lost < loaded)
+    }
 
     /** What the last check of [driver] found, in a line, or null before its first. */
     fun result(context: Context, driver: String) =
@@ -110,7 +151,12 @@ object DriverCheck {
         "timeline semaphores from Khronos's layer".takeIf { saved.optBoolean("timelines") },
         offIn(saved).takeIf { it.isNotEmpty() }?.let { it.joinToString(", ") + " off" },
         "compressed textures kept compressed".takeIf { saved.optBoolean("transcode") },
+        UNPACKED.takeIf { saved.has(TRANSCODE_FAILED) },
     ).joinToString(" · ")
+
+    /** Android's driver a game stopped loading on with the transcoder on, while it's still that driver. */
+    private const val TRANSCODE_FAILED = "transcodeFailedOn"
+    private const val UNPACKED = "compressed textures load unpacked: a game lost the GPU loading them kept compressed"
 
     private fun offIn(saved: JSONObject) = saved.optString("off").split(',').filter { it.isNotEmpty() }
 
@@ -153,10 +199,19 @@ object DriverCheck {
             Found.Failed -> "the test couldn't draw (drivercheck.log): games on this driver run with everything on"
         })
         // Wrong or failed is remembered too, so a driver isn't checked before every game, nor waited on when it hangs.
-        val transcoded = found is Found.Right && Drivers.transcodable(driver) &&
+        // The transcoder isn't tried again on an Android driver a game already stopped loading on with it, nor when
+        // the Options decide it.
+        val failedOn = saved(context, driver)?.optString(TRANSCODE_FAILED, null)?.takeIf { it == androidDriver(driver) }
+        if (failedOn != null && Drivers.transcodable(driver))
+            ScreenLog.add("driver check: $UNPACKED")
+        val transcoded = found is Found.Right && Drivers.transcodable(driver) && failedOn == null &&
+                         transcoderOption(context, driver) == null &&
                          transcoderDraws(paths, driver, hiding(base, found.off))
-        return save(context, driver, version, found, transcoded, timelines)
+        return save(context, driver, version, found, transcoded, timelines, failedOn)
     }
+
+    /** The part of a check's version that is Android's own driver: empty for the others. */
+    private fun androidDriver(driver: String) = if (Drivers.isPhone(driver)) Gpu.driverVersion.orEmpty() else ""
 
     /** Whether the game's compressed textures draw right through the transcoder, on top of what's off. */
     private fun transcoderDraws(paths: Paths, driver: String, environment: Map<String, String>): Boolean {
@@ -191,18 +246,19 @@ object DriverCheck {
      * What a check holds for: the way it searches; Android's own driver, which changes with phone updates, the others
      * only with a runtime, which forgets every check; and a driver's Options, which change what it draws.
      */
-    private fun version(context: Context, driver: String) = "$REVISION · " +
-        (if (Drivers.isPhone(driver)) Gpu.driverVersion.orEmpty() else "") + " · " + Drivers.options(context, driver)
+    private fun version(context: Context, driver: String) =
+        "$REVISION · " + androidDriver(driver) + " · " + Drivers.options(context, driver)
 
     private fun saved(context: Context, driver: String): JSONObject? =
         json(Settings(context).driverChecks).optJSONObject(driver)
 
     private fun save(context: Context, driver: String, version: String, found: Found, transcoded: Boolean,
-                     timelines: Boolean): JSONObject {
+                     timelines: Boolean, transcodeFailedOn: String?): JSONObject {
         val settings = Settings(context)
         val off = (found as? Found.Right)?.off.orEmpty()
         val result = JSONObject().put("version", version).put("off", off.joinToString(",")).put("transcode", transcoded)
             .put("failed", found == Found.Failed).put("wrong", found == Found.Wrong).put("timelines", timelines)
+        if (transcodeFailedOn != null) result.put(TRANSCODE_FAILED, transcodeFailedOn)
         settings.driverChecks = json(settings.driverChecks).put(driver, result).toString()
         return result
     }
